@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -59,6 +59,8 @@ struct kgsl_clk_stats {
  * @idle_needed - true if the device needs a idle before clock change
  * @irq_name - resource name for the IRQ
  * @clk_stats - structure of clock statistics
+ * @pm_qos_req_dma - the power management quality of service structure
+ * @pm_qos_latency - allowed CPU latency in microseconds
  */
 
 struct kgsl_pwrctrl {
@@ -83,6 +85,8 @@ struct kgsl_pwrctrl {
 	const char *irq_name;
 	s64 time;
 	struct kgsl_clk_stats clk_stats;
+	struct pm_qos_request pm_qos_req_dma;
+	unsigned int pm_qos_latency;
 };
 
 void kgsl_pwrctrl_irq(struct kgsl_device *device, int state);
