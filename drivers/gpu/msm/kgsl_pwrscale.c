@@ -51,7 +51,6 @@ static struct kgsl_pwrscale_policy *kgsl_pwrscale_policies[] = {
 #ifdef CONFIG_MSM_DCVS
 	&kgsl_pwrscale_policy_msm,
 #endif
-	&kgsl_pwrscale_policy_conservative,
 	NULL
 };
 
@@ -270,9 +269,6 @@ int kgsl_pwrscale_policy_add_files(struct kgsl_device *device,
 {
 	int ret;
 
-	kobject_del(&pwrscale->kobj);
-	kobject_put(&pwrscale->kobj);
-
 	ret = kobject_add(&pwrscale->kobj, &device->pwrscale_kobj,
 		"%s", pwrscale->policy->name);
 
@@ -280,6 +276,11 @@ int kgsl_pwrscale_policy_add_files(struct kgsl_device *device,
 		return ret;
 
 	ret = sysfs_create_group(&pwrscale->kobj, attr_group);
+
+	if (ret) {
+		kobject_del(&pwrscale->kobj);
+		kobject_put(&pwrscale->kobj);
+	}
 
 	return ret;
 }
@@ -289,6 +290,8 @@ void kgsl_pwrscale_policy_remove_files(struct kgsl_device *device,
 				       struct attribute_group *attr_group)
 {
 	sysfs_remove_group(&pwrscale->kobj, attr_group);
+	kobject_del(&pwrscale->kobj);
+	kobject_put(&pwrscale->kobj);
 }
 
 static void _kgsl_pwrscale_detach_policy(struct kgsl_device *device)
@@ -303,8 +306,6 @@ static void _kgsl_pwrscale_detach_policy(struct kgsl_device *device)
 
 		kgsl_pwrctrl_pwrlevel_change(device,
 				device->pwrctrl.max_pwrlevel);
-		device->pwrctrl.default_pwrlevel =
-				device->pwrctrl.max_pwrlevel;
 	}
 	device->pwrscale.policy = NULL;
 }
@@ -337,8 +338,6 @@ int kgsl_pwrscale_attach_policy(struct kgsl_device *device,
 
 	device->pwrscale.policy = policy;
 
-	device->pwrctrl.default_pwrlevel =
-			device->pwrctrl.init_pwrlevel;
 	/* Pwrscale is enabled by default at attach time */
 	kgsl_pwrscale_enable(device);
 
