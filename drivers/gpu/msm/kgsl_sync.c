@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2013, 2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -11,10 +11,12 @@
  *
  */
 
-#include <linux/err.h>
 #include <linux/file.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+
+#include <asm/current.h>
 
 #include "kgsl_sync.h"
 
@@ -51,11 +53,17 @@ static int kgsl_sync_pt_has_signaled(struct sync_pt *pt)
 	struct kgsl_sync_timeline *ktimeline =
 		 (struct kgsl_sync_timeline *) pt->parent;
 	unsigned int ts = kpt->timestamp;
-	unsigned int last_ts = ktimeline->last_timestamp;
+	unsigned int last_ts ;
+	spin_lock(&ktimeline->lock);
+
+	last_ts = ktimeline->last_timestamp;
+
 	if (timestamp_cmp(last_ts, ts) >= 0) {
 		/* signaled */
+		spin_unlock(&ktimeline->lock);
 		return 1;
 	}
+	spin_unlock(&ktimeline->lock);
 	return 0;
 }
 
@@ -87,6 +95,8 @@ static inline void kgsl_fence_event_cb(struct kgsl_device *device,
 	void *priv, u32 context_id, u32 timestamp, u32 type)
 {
 	struct kgsl_fence_event_priv *ev = priv;
+
+	/* Signal event time timeline for every event type */
 	kgsl_sync_timeline_signal(ev->context->timeline, ev->timestamp);
 	kgsl_context_put(ev->context);
 	kfree(ev);
@@ -125,8 +135,10 @@ int kgsl_add_fence_event(struct kgsl_device *device,
 
 	context = kgsl_context_get_owner(owner, context_id);
 
-	if (context == NULL)
-		goto fail_pt;
+	if (context == NULL) {
+		kfree(event);
+		return -EINVAL;
+	}
 
 	event->context = context;
 	event->timestamp = timestamp;
@@ -185,6 +197,39 @@ fail_pt:
 	return ret;
 }
 
+static unsigned int kgsl_sync_get_timestamp(
+	struct kgsl_sync_timeline *ktimeline, enum kgsl_timestamp_type type)
+{
+	unsigned int ret = 0;
+
+	struct kgsl_context *context = kgsl_context_get(ktimeline->device,
+			ktimeline->context_id);
+
+	if (context)
+		ret = kgsl_readtimestamp(ktimeline->device, context, type);
+
+	kgsl_context_put(context);
+	return ret;
+}
+
+static void kgsl_sync_timeline_value_str(struct sync_timeline *sync_timeline,
+					 char *str, int size)
+{
+	struct kgsl_sync_timeline *ktimeline =
+		(struct kgsl_sync_timeline *) sync_timeline;
+	unsigned int timestamp_retired = kgsl_sync_get_timestamp(ktimeline,
+		KGSL_TIMESTAMP_RETIRED);
+	snprintf(str, size, "%u retired:%u", ktimeline->last_timestamp,
+		timestamp_retired);
+}
+
+static void kgsl_sync_pt_value_str(struct sync_pt *sync_pt,
+				   char *str, int size)
+{
+	struct kgsl_sync_pt *kpt = (struct kgsl_sync_pt *) sync_pt;
+	snprintf(str, size, "%u", kpt->timestamp);
+}
+
 static void kgsl_sync_timeline_release_obj(struct sync_timeline *sync_timeline)
 {
 	/*
@@ -199,6 +244,8 @@ static const struct sync_timeline_ops kgsl_sync_timeline_ops = {
 	.dup = kgsl_sync_pt_dup,
 	.has_signaled = kgsl_sync_pt_has_signaled,
 	.compare = kgsl_sync_pt_compare,
+	.timeline_value_str = kgsl_sync_timeline_value_str,
+	.pt_value_str = kgsl_sync_pt_value_str,
 	.release_obj = kgsl_sync_timeline_release_obj,
 };
 
@@ -206,13 +253,26 @@ int kgsl_sync_timeline_create(struct kgsl_context *context)
 {
 	struct kgsl_sync_timeline *ktimeline;
 
+	/* Generate a name which includes the thread name, thread id, process
+	 * name, process id, and context id. This makes it possible to
+	 * identify the context of a timeline in the sync dump. */
+	char ktimeline_name[sizeof(context->timeline->name)] = {};
+	snprintf(ktimeline_name, sizeof(ktimeline_name),
+		"%s_%.15s(%d)-%.15s(%d)-%d",
+		context->dev_priv->device->name,
+		current->group_leader->comm, current->group_leader->pid,
+		current->comm, current->pid, context->id);
+
 	context->timeline = sync_timeline_create(&kgsl_sync_timeline_ops,
-		(int) sizeof(struct kgsl_sync_timeline), "kgsl-timeline");
+		(int) sizeof(struct kgsl_sync_timeline), ktimeline_name);
 	if (context->timeline == NULL)
 		return -EINVAL;
 
 	ktimeline = (struct kgsl_sync_timeline *) context->timeline;
 	ktimeline->last_timestamp = 0;
+	ktimeline->device = context->dev_priv->device;
+	ktimeline->context_id = context->id;
+	spin_lock_init(&ktimeline->lock);
 
 	return 0;
 }
@@ -223,74 +283,14 @@ void kgsl_sync_timeline_signal(struct sync_timeline *timeline,
 	struct kgsl_sync_timeline *ktimeline =
 		(struct kgsl_sync_timeline *) timeline;
 
+	spin_lock(&ktimeline->lock);
 	if (timestamp_cmp(timestamp, ktimeline->last_timestamp) > 0)
 		ktimeline->last_timestamp = timestamp;
+	spin_unlock(&ktimeline->lock);
 	sync_timeline_signal(timeline);
 }
 
 void kgsl_sync_timeline_destroy(struct kgsl_context *context)
 {
 	sync_timeline_destroy(context->timeline);
-}
-
-static void kgsl_sync_callback(struct sync_fence *fence,
-	struct sync_fence_waiter *waiter)
-{
-	struct kgsl_sync_fence_waiter *kwaiter =
-		(struct kgsl_sync_fence_waiter *) waiter;
-	kwaiter->func(kwaiter->priv);
-	sync_fence_put(kwaiter->fence);
-	kfree(kwaiter);
-}
-
-struct kgsl_sync_fence_waiter *kgsl_sync_fence_async_wait(int fd,
-	void (*func)(void *priv), void *priv)
-{
-	struct kgsl_sync_fence_waiter *kwaiter;
-	struct sync_fence *fence;
-	int status;
-
-	fence = sync_fence_fdget(fd);
-	if (fence == NULL)
-		return ERR_PTR(-EINVAL);
-
-	/* create the waiter */
-	kwaiter = kzalloc(sizeof(*kwaiter), GFP_ATOMIC);
-	if (kwaiter == NULL) {
-		sync_fence_put(fence);
-		return ERR_PTR(-ENOMEM);
-	}
-	kwaiter->fence = fence;
-	kwaiter->priv = priv;
-	kwaiter->func = func;
-	sync_fence_waiter_init((struct sync_fence_waiter *) kwaiter,
-		kgsl_sync_callback);
-
-	/* if status then error or signaled */
-	status = sync_fence_wait_async(fence,
-		(struct sync_fence_waiter *) kwaiter);
-	if (status) {
-		kfree(kwaiter);
-		sync_fence_put(fence);
-		if (status < 0)
-			kwaiter = ERR_PTR(status);
-		else
-			kwaiter = NULL;
-	}
-
-	return kwaiter;
-}
-
-int kgsl_sync_fence_async_cancel(struct kgsl_sync_fence_waiter *kwaiter)
-{
-	if (kwaiter == NULL)
-		return 0;
-
-	if(sync_fence_cancel_async(kwaiter->fence,
-		(struct sync_fence_waiter *) kwaiter) == 0) {
-		sync_fence_put(kwaiter->fence);
-		kfree(kwaiter);
-		return 1;
-	}
-	return 0;
 }
